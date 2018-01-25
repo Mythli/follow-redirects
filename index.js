@@ -4,6 +4,7 @@ var https = require("https");
 var assert = require("assert");
 var Writable = require("stream").Writable;
 var debug = require("debug")("follow-redirects");
+var _ = require('lodash');
 
 // RFC7231§4.2.1: Of the request methods defined by this specification,
 // the GET, HEAD, OPTIONS, and TRACE methods are defined to be safe.
@@ -21,7 +22,6 @@ var eventHandlers = Object.create(null);
 function RedirectableRequest(options, responseCallback) {
   // Initialize the request
   Writable.call(this);
-  options.headers = options.headers || {};
   this._options = options;
   this._redirectCount = 0;
   this._requestBodyLength = 0;
@@ -54,61 +54,6 @@ function RedirectableRequest(options, responseCallback) {
   this._performRequest();
 }
 RedirectableRequest.prototype = Object.create(Writable.prototype);
-
-// Writes buffered data to the current native request
-RedirectableRequest.prototype.write = function (data, encoding, callback) {
-  if (this._requestBodyLength + data.length <= this._options.maxBodyLength) {
-    this._requestBodyLength += data.length;
-    this._requestBodyBuffers.push({ data: data, encoding: encoding });
-    this._currentRequest.write(data, encoding, callback);
-  }
-  else {
-    this.emit("error", new Error("Request body larger than maxBodyLength limit"));
-    this.abort();
-  }
-};
-
-// Ends the current native request
-RedirectableRequest.prototype.end = function (data, encoding, callback) {
-  var currentRequest = this._currentRequest;
-  if (!data) {
-    currentRequest.end(null, null, callback);
-  }
-  else {
-    this.write(data, encoding, function () {
-      currentRequest.end(null, null, callback);
-    });
-  }
-};
-
-// Sets a header value on the current native request
-RedirectableRequest.prototype.setHeader = function (name, value) {
-  this._options.headers[name] = value;
-  this._currentRequest.setHeader(name, value);
-};
-
-// Clears a header value on the current native request
-RedirectableRequest.prototype.removeHeader = function (name) {
-  delete this._options.headers[name];
-  this._currentRequest.removeHeader(name);
-};
-
-// Proxy all other public ClientRequest methods
-[
-  "abort", "flushHeaders", "getHeader",
-  "setNoDelay", "setSocketKeepAlive", "setTimeout",
-].forEach(function (method) {
-  RedirectableRequest.prototype[method] = function (a, b) {
-    return this._currentRequest[method](a, b);
-  };
-});
-
-// Proxy all public ClientRequest properties
-["aborted", "connection", "socket"].forEach(function (property) {
-  Object.defineProperty(RedirectableRequest.prototype, property, {
-    get: function () { return this._currentRequest[property]; },
-  });
-});
 
 // Executes the next native request (initial or redirect)
 RedirectableRequest.prototype._performRequest = function () {
@@ -192,6 +137,34 @@ RedirectableRequest.prototype._processResponse = function (response) {
       }
     }
 
+    // using set-cookies on next request
+    // TODO: only set-cookie on self-host
+    let setCookies = response.headers['set-cookie'] ? response.headers['set-cookie'] : [];
+
+    let parsedCookies = setCookies.reduce((parsingCookies, cookie) => {
+      let [l, name, value] = cookie.match(/(.*?)=(.*?);/);
+      parsingCookies[name.trim()] = value;
+      return parsingCookies;
+    }, {});
+
+    let currentCookies = _.get(headers, 'cookie', '')
+        .split(';')
+        .reduce((parsingCookies, cookie) => {
+            let [l, name, value] = cookie.match(/(.*?)=(.*)/);
+            parsingCookies[name.trim()] = value;
+            return parsingCookies;
+        }, {});
+
+    let mergedCookies = {...currentCookies, ...parsedCookies};
+
+
+    headers.cookie = _.reduce(mergedCookies, (mergingCookies, val, name) => {
+      mergingCookies = `${mergingCookies}${name}=${val}; `;
+      return mergingCookies;
+    }, '');
+
+    //--
+
     // Drop the Host header, as the redirect might lead to a different host
     if (!this._isRedirect) {
       for (header in headers) {
@@ -214,7 +187,59 @@ RedirectableRequest.prototype._processResponse = function (response) {
     this.emit("response", response);
 
     // Clean up
-    this._requestBodyBuffers = [];
+    delete this._options;
+    delete this._requestBodyBuffers;
+  }
+};
+
+// Aborts the current native request
+RedirectableRequest.prototype.abort = function () {
+  this._currentRequest.abort();
+};
+
+// Flushes the headers of the current native request
+RedirectableRequest.prototype.flushHeaders = function () {
+  this._currentRequest.flushHeaders();
+};
+
+// Sets the noDelay option of the current native request
+RedirectableRequest.prototype.setNoDelay = function (noDelay) {
+  this._currentRequest.setNoDelay(noDelay);
+};
+
+// Sets the socketKeepAlive option of the current native request
+RedirectableRequest.prototype.setSocketKeepAlive = function (enable, initialDelay) {
+  this._currentRequest.setSocketKeepAlive(enable, initialDelay);
+};
+
+// Sets the timeout option of the current native request
+RedirectableRequest.prototype.setTimeout = function (timeout, callback) {
+  this._currentRequest.setTimeout(timeout, callback);
+};
+
+// Writes buffered data to the current native request
+RedirectableRequest.prototype.write = function (data, encoding, callback) {
+  if (this._requestBodyLength + data.length <= this._options.maxBodyLength) {
+    this._requestBodyLength += data.length;
+    this._requestBodyBuffers.push({ data: data, encoding: encoding });
+    this._currentRequest.write(data, encoding, callback);
+  }
+  else {
+    this.emit("error", new Error("Request body larger than maxBodyLength limit"));
+    this.abort();
+  }
+};
+
+// Ends the current native request
+RedirectableRequest.prototype.end = function (data, encoding, callback) {
+  var currentRequest = this._currentRequest;
+  if (!data) {
+    currentRequest.end(null, null, callback);
+  }
+  else {
+    this.write(data, encoding, function () {
+      currentRequest.end(null, null, callback);
+    });
   }
 };
 
